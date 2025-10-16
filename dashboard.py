@@ -1,128 +1,179 @@
+# dashboard.py
+# Robustes SMA-Crossover-Dashboard (flacht yfinance-Spalten ab)
+
 import streamlit as st
-import yfinance as yf
 import pandas as pd
 import numpy as np
+import yfinance as yf
 
-st.set_page_config(page_title="KI-Trading-Agent", layout="wide")
-st.title("🤖 KI-Trading-Agent – Analyse & Backtesting")
+# ---------- Seiteneinstellungen ----------
+st.set_page_config(
+    page_title="KI-Trading-Agent – Analyse & Backtesting",
+    page_icon="🧠",
+    layout="wide",
+)
 
-# Eingaben
-ticker = st.text_input("Aktien-Ticker eingeben (z. B. NVDA, AAPL, TSLA):", "NVDA").upper().strip()
-period = st.selectbox("Zeitraum", ["1mo", "3mo", "6mo", "1y"], index=2)
-interval = st.selectbox("Intervall", ["1d", "1h"], index=0)
+st.title("🧠 KI-Trading-Agent – Analyse & Backtesting")
 
-@st.cache_data(show_spinner=False)
-def load_data(tkr: str, per: str, intr: str) -> pd.DataFrame:
-    """Robuster Datenabruf + Fallbacks; gibt DataFrame mit Spalte 'Close' zurück."""
-    tk = yf.Ticker(tkr)
-    df = tk.history(period=per, interval=intr, auto_adjust=False)
+# ---------- UI ----------
+ticker = st.text_input("Aktien-Ticker eingeben (z. B. NVDA, AAPL, TSLA):", value="NVDA").upper()
 
-    # Fallbacks, falls leer
-    if df.empty and per != "3mo":
-        df = tk.history(period="3mo", interval=intr, auto_adjust=False)
-    if df.empty and per != "1mo":
-        df = tk.history(period="1mo", interval=intr, auto_adjust=False)
+period_options = {
+    "1m": "1mo",
+    "3m": "3mo",
+    "6m": "6mo",
+    "1y": "1y",
+    "2y": "2y",
+    "5y": "5y",
+    "10y": "10y",
+    "max": "max",
+}
+period_key = st.selectbox("Zeitraum", list(period_options.keys()), index=2)
+period_val = period_options[period_key]
 
-    # Falls Close fehlt, 'Adj Close' verwenden
-    if "Close" not in df.columns and "Adj Close" in df.columns:
-        df = df.rename(columns={"Adj Close": "Close"})
+interval_options = {
+    "1d (Tagesdaten)": "1d",
+    "1h (Stunden)": "1h",
+}
+interval_key = st.selectbox("Intervall", list(interval_options.keys()), index=0)
+interval_val = interval_options[interval_key]
 
+# ---------- Sidebar ----------
+st.sidebar.header("⚙️ Einstellungen")
+fast = st.sidebar.number_input("SMA schnell", min_value=5, max_value=100, value=20)
+slow = st.sidebar.number_input("SMA langsam", min_value=10, max_value=250, value=50)
+if fast >= slow:
+    st.sidebar.warning("Hinweis: 'SMA schnell' sollte < 'SMA langsam' sein.")
+fee_bps = st.sidebar.number_input("Gebühren pro Trade (bps)", min_value=0, max_value=100, value=5)  # 5 bps = 0.05%
+
+# ---------- Helpers ----------
+def flatten_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """MultiIndex-Spalten zu flachen Namen machen."""
+    if isinstance(df.columns, pd.MultiIndex):
+        new_cols = []
+        for tup in df.columns:
+            parts = [str(p) for p in tup if p is not None and str(p) != ""]
+            name = "_".join(parts).strip("_")
+            new_cols.append(name)
+        df = df.copy()
+        df.columns = new_cols
     return df
 
-if ticker:
-    data = load_data(ticker, period, interval)
+def find_close_column(cols) -> str | None:
+    """Eine passende Close-Spalte finden (Close, Adj Close, *_Close, Close_* etc.)."""
+    candidates = [c for c in cols if c.lower() == "close"]
+    if candidates:
+        return candidates[0]
+    # häufige Varianten aus yfinance-MultiIndex-Flattening
+    for key in ("adj close", "close", ".close", "_close"):
+        hits = [c for c in cols if key in c.lower()]
+        if hits:
+            return hits[0]
+    # fallback: irgendwas mit "close"
+    any_hits = [c for c in cols if "close" in c.lower()]
+    return any_hits[0] if any_hits else None
 
-    if data.empty or "Close" not in data.columns:
-        st.warning("Keine Kursdaten gefunden. Prüfe Ticker (z. B. NVDA, AAPL, TSLA) oder Internetverbindung.")
-    else:
-        data = data.dropna(subset=["Close"]).copy()
+# ---------- Daten laden (mit Caching) ----------
+@st.cache_data(ttl=3600)
+def load_prices(tick: str, period: str, interval: str) -> pd.DataFrame:
+    df = yf.download(
+        tick,
+        period=period,
+        interval=interval,
+        auto_adjust=True,   # bereits adjustierte Close
+        progress=False,
+    )
+    df = flatten_columns(df)
 
-        # Indikatoren
-        data["SMA20"] = data["Close"].rolling(window=20, min_periods=20).mean()
-        data["SMA50"] = data["Close"].rolling(window=50, min_periods=50).mean()
+    # Close-Spalte robust bestimmen
+    close_col = find_close_column(df.columns)
+    if close_col is None:
+        return pd.DataFrame()  # leer -> später handled
 
-        # Handelssignale: SMA-Crossover
-        data["Signal"] = np.where(data["SMA20"] > data["SMA50"], 1, 0)
-        data["Position"] = data["Signal"].diff()
+    # Einheitliche 'Close'-Spalte anlegen, damit Rest des Codes simpel bleibt
+    out = df.copy()
+    out["Close"] = out[close_col].astype(float)
+    return out
 
-        st.subheader("📊 Kursverlauf mit gleitenden Durchschnitten")
-        st.line_chart(data[["Close", "SMA20", "SMA50"]].dropna(), use_container_width=True)
+df = load_prices(ticker, period_val, interval_val)
 
-        buy_signals = data[data["Position"] == 1]
-        sell_signals = data[data["Position"] == -1]
+if df is None or df.empty or "Close" not in df.columns:
+    st.warning("Keine Kursdaten gefunden. Prüfe Ticker, Zeitraum oder Intervall.")
+    st.stop()
 
-        st.subheader("💡 Letzte Handelssignale")
-        c1, c2 = st.columns(2)
-        with c1:
-            st.write("**Kaufsignale:**")
-            st.dataframe(buy_signals[["Close"]].tail())
-        with c2:
-            st.write("**Verkaufssignale:**")
-            st.dataframe(sell_signals[["Close"]].tail())
+# ---------- Indikatoren ----------
+df = df.copy()
+df["SMA_fast"] = df["Close"].rolling(int(fast)).mean()
+df["SMA_slow"] = df["Close"].rolling(int(slow)).mean()
 
-        # Backtest (sehr einfach)
-        data["Return"] = data["Close"].pct_change()
-        data["Strategy"] = data["Signal"].shift(1) * data["Return"]
-        perf = (1 + data["Strategy"].dropna()).prod() - 1
+# ---------- Chart ----------
+st.subheader("📊 Kursverlauf mit gleitenden Durchschnitten")
+plot_cols = df[["Close", "SMA_fast", "SMA_slow"]].dropna().rename(
+    columns={"SMA_fast": f"SMA{fast}", "SMA_slow": f"SMA{slow}"}
+)
+st.line_chart(plot_cols)
 
-        st.subheader("📈 Backtesting-Ergebnis")
-        st.metric("Gesamt-Performance", f"{perf*100:.2f}%")
+# ---------- Signale ----------
+position = (df["SMA_fast"] > df["SMA_slow"]).astype(int)
+signal = position.diff().fillna(0)       # +1 = Buy, -1 = Sell
 
-# ========= Risikomanagement & Positionsgröße =========
-st.subheader("🛡️ Risikomanagement & Positionsgröße")
+buy_idx = signal[signal == 1].index
+sell_idx = signal[signal == -1].index
 
-# Sidebar-Parameter
-st.sidebar.header("Risikoparameter")
-equity = st.sidebar.number_input("Kontogröße (€)", min_value=100.0, value=5000.0, step=100.0)
-risk_pct = st.sidebar.slider("Risiko pro Trade (%)", min_value=0.1, max_value=5.0, value=1.0, step=0.1)
-sl_mode = st.sidebar.selectbox("Stop-Loss-Methode", ["Prozent", "ATR x"])
-sl_percent = st.sidebar.number_input("Stop-Loss (% unter Preis)", min_value=0.1, max_value=20.0, value=2.0, step=0.1)
-atr_mult = st.sidebar.number_input("ATR-Multiplikator", min_value=0.5, max_value=5.0, value=2.0, step=0.5)
-atr_window = st.sidebar.number_input("ATR-Fenster", min_value=5, max_value=50, value=14, step=1)
+buy_signals = pd.DataFrame({"Date": buy_idx, "Close": df.loc[buy_idx, "Close"].values})
+sell_signals = pd.DataFrame({"Date": sell_idx, "Close": df.loc[sell_idx, "Close"].values})
 
-# Aktueller Preis
-price = float(data["Close"].iloc[-1])
+st.subheader("💡 Letzte Handelssignale")
+c1, c2 = st.columns(2)
+with c1:
+    st.write("**Kaufsignale:**")
+    st.dataframe(buy_signals.tail(10), use_container_width=True)
+with c2:
+    st.write("**Verkaufssignale:**")
+    st.dataframe(sell_signals.tail(10), use_container_width=True)
 
-# ATR (ohne Zusatzbibliotheken)
-def compute_atr(df: pd.DataFrame, window: int = 14) -> pd.Series:
-    if not {"High", "Low", "Close"}.issubset(df.columns):
-        return pd.Series(index=df.index, dtype=float)
-    prev_close = df["Close"].shift(1)
-    tr1 = (df["High"] - df["Low"]).abs()
-    tr2 = (df["High"] - prev_close).abs()
-    tr3 = (df["Low"] - prev_close).abs()
-    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-    return tr.rolling(window=window, min_periods=window).mean()
+# ---------- Backtest (einfach, mit Gebühren) ----------
+ret = df["Close"].pct_change().fillna(0)
+turnover = position.diff().abs().fillna(0)               # 1 bei Entry/Exit
+cost = turnover * (fee_bps / 10000.0)                    # bps => %
 
-atr = compute_atr(data, atr_window)
-atr_value = float(atr.dropna().iloc[-1]) if not atr.dropna().empty else None
+strat_ret = ret * position.shift(1).fillna(0) - cost
+equity = (1 + strat_ret).cumprod().fillna(1.0)
+perf = float(equity.iloc[-1] - 1.0)
 
-# Stop-Loss bestimmen
-if sl_mode == "Prozent":
-    stop_loss = price * (1 - sl_percent / 100.0)
-elif atr_value is not None:
-    stop_loss = price - atr_mult * atr_value
-else:
-    # Fallback: 2% wenn ATR nicht verfügbar ist
-    stop_loss = price * 0.98
+# Kennzahlen
+def max_drawdown(series: pd.Series) -> float:
+    roll_max = series.cummax()
+    dd = series / roll_max - 1.0
+    return float(dd.min())
 
-risk_per_share = max(price - stop_loss, 0.0)
-max_risk_eur = equity * (risk_pct / 100.0)
-position_size = int(max_risk_eur // risk_per_share) if risk_per_share > 0 else 0
-notional = position_size * price
-potential_loss = position_size * risk_per_share
-take_profit = price + 2 * risk_per_share  # simples Chance/Risiko 2:1
+def sharpe_ratio(returns: pd.Series, periods_per_year: int) -> float:
+    if returns.std() == 0:
+        return 0.0
+    return float((returns.mean() / returns.std()) * np.sqrt(periods_per_year))
 
-c1, c2, c3 = st.columns(3)
-c1.metric("Aktueller Preis", f"{price:,.2f} €" if price < 10000 else f"{price:,.2f}")
-c2.metric("Vorgesehener Stop-Loss", f"{stop_loss:,.2f}")
-c3.metric("Take-Profit (2:1 R:R)", f"{take_profit:,.2f}")
+periods_map = {"1d": 252, "1h": 252 * 6}
+ppy = periods_map.get(interval_val, 252)
 
-st.write(f"**Risiko pro Trade:** {risk_pct:.2f}% von {equity:,.0f} € → **{max_risk_eur:,.2f} €**")
-st.write(f"**Risiko je Stück:** {risk_per_share:,.2f} → **Positionsgröße:** {position_size} Stück")
-st.write(f"**Ordervolumen (ca.):** {notional:,.2f} €  |  **max. Verlust bei Stop:** {potential_loss:,.2f} €")
+days = max(1, len(df))
+try:
+    cagr = equity.iloc[-1] ** (ppy / days) - 1.0
+except Exception:
+    cagr = 0.0
 
-if atr_value is not None:
-    st.caption(f"ATR({atr_window}) ≈ {atr_value:.3f} (für ATR-Stop-Loss genutzt, falls ausgewählt)")
+dd = max_drawdown(equity)
+sr = sharpe_ratio(strat_ret.fillna(0), periods_per_year=ppy)
 
-st.divider()
+st.subheader("📈 Equity-Kurve (Strategie)")
+st.line_chart(equity.rename("Equity"))
+
+st.subheader("📊 Backtesting-Ergebnis")
+m1, m2, m3 = st.columns(3)
+m1.metric("Gesamt-Performance", f"{perf * 100:.2f}%")
+m2.metric("Max Drawdown", f"{dd * 100:.2f}%")
+m3.metric("Sharpe", f"{sr:.2f}")
+
+st.caption(
+    "Hinweis: Vereinfachte Demo (SMA-Crossover). Gebühren als bps pro Entry/Exit, "
+    "keine Slippage/Steuern/Ausführungsrisiken. Keine Finanzberatung."
+)
