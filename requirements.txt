@@ -1,0 +1,10 @@
+yfinance
+pandas
+numpy
+ta
+backtesting
+fastapi
+uvicorn
+plotly
+streamlit
+
